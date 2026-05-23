@@ -12,8 +12,6 @@
 
 ## Features
 
-* **Real-Time WebGL Interception:** Hooks directly into GeoGuessr's canvas to instantly convert the panorama into dynamic ASCII text art.
-* **Native Sidebar UI Integration:** Injects a clean, custom "ASCII Shaders" toggle button directly into the game's friend/chat sidebar layout.
 * **Master Rendering Sliders:** On-the-fly adjustment controls for resolution density, character palette depth, brightness, contrast, and color saturation.
 * **Atmospheric Modifiers:** Smooth out text or add grit using the custom canvas pre-blur slider and Gaussian noise injector.
 * **Visual Overhauls:** Toggle between solid retro blocks (**█**), edge-detection outlines (`*`), or color inversion.
