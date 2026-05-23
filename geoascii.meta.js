@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GeoASCII
 // @description  Transforms GeoGuessr panoramas into a live, fully customizable ASCII text art display with native retro filter controls.
-// @version      1.8.0
+// @version      1.9.0
 // @author       maxtmiller
 // @match        https://www.geoguessr.com/*
 // @run-at       document-start
