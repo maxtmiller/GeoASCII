@@ -8,7 +8,7 @@
 
 ## Preview
 
-
+<img width="1710" height="986" alt="Screenshot 2026-05-23 at 1 13 31 in the morning" src="https://github.com/user-attachments/assets/a9da60a3-e811-4968-b7fa-3c13e06570b5" />
 
 ## Features
 
