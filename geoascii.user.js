@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         GeoASCII
 // @description  Transforms GeoGuessr panoramas into a live, fully customizable ASCII text art display with native retro filter controls.
-// @version      1.10.0
+// @version      1.11.0
 // @author       maxtmiller
 // @match        https://www.geoguessr.com/*
 // @run-at       document-start
 // @license      MIT
-// @icon         https://raw.githubusercontent.com/maxtmiller/GeoASCII/main/assets/geoascii-icon.png
+// @icon         https://raw.githubusercontent.com/maxtmiller/GeoASCII/main/assets/geoascii-icon-32.png
 // @namespace    https://github.com/maxtmiller/GeoASCII
 // @grant        none
 // @downloadURL  https://github.com/maxtmiller/GeoASCII/raw/main/geoascii.user.js
