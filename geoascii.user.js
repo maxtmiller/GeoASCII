@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GeoASCII
 // @description  Transforms GeoGuessr panoramas into a live, fully customizable ASCII text art display with native retro filter controls.
-// @version      1.11.0
+// @version      1.12.0
 // @author       maxtmiller
 // @match        https://www.geoguessr.com/*
 // @run-at       document-start
@@ -26,6 +26,7 @@ const DEFAULT_NOISE = 0;
 const DEFAULT_BLUR = 0.0;
 const DEFAULT_TINT_HEX = "#bc13fe";
 const DEFAULT_PALETTE_SIZE = 10;
+const DEFAULT_CMD_COLOURS = false;
 
 let asciiEnabled = true;
 let charResolution = DEFAULT_RESOLUTION;
@@ -36,6 +37,14 @@ let noiseSetting = DEFAULT_NOISE;
 let blurSetting = DEFAULT_BLUR;
 let paletteSizeSetting = DEFAULT_PALETTE_SIZE;
 
+let resolutionSettingEnabled = true;
+let paletteSettingEnabled = true;
+let brightnessSettingEnabled = true;
+let contrastSettingEnabled = true;
+let saturationSettingEnabled = true;
+let noiseSettingEnabled = true;
+let blurSettingEnabled = true;
+
 // Feature Toggles
 let solidPixelMode = false;
 let edgeDetectionMode = false;
@@ -43,6 +52,7 @@ let colorInversionMode = false;
 let scanlineMode = false;
 let thermalMode = false;
 let tintMode = false;
+let cmdColoursMode = DEFAULT_CMD_COLOURS;
 let customTintHex = DEFAULT_TINT_HEX;
 
 // --- Performance System ---
@@ -75,25 +85,27 @@ let cachedPaletteSize = null;
 let cachedPalette = "";
 
 function getDynamicPalette() {
-    if (cachedPaletteSize === paletteSizeSetting) return cachedPalette;
+    const effectivePaletteSize = paletteSettingEnabled ? paletteSizeSetting : DEFAULT_PALETTE_SIZE;
 
-    if (paletteSizeSetting >= MASTER_PALETTE.length) {
-        cachedPaletteSize = paletteSizeSetting;
+    if (cachedPaletteSize === effectivePaletteSize) return cachedPalette;
+
+    if (effectivePaletteSize >= MASTER_PALETTE.length) {
+        cachedPaletteSize = effectivePaletteSize;
         cachedPalette = MASTER_PALETTE;
         return cachedPalette;
     }
     let result = "";
-    const step = (MASTER_PALETTE.length - 1) / (paletteSizeSetting - 1);
-    for (let i = 0; i < paletteSizeSetting; i++) {
+    const step = (MASTER_PALETTE.length - 1) / (effectivePaletteSize - 1);
+    for (let i = 0; i < effectivePaletteSize; i++) {
         result += MASTER_PALETTE_BASE[i];
     }
-    if (paletteSizeSetting > 10) {
-        for (let i = 0; i < paletteSizeSetting - 10; i++) {
+    if (effectivePaletteSize > 10) {
+        for (let i = 0; i < effectivePaletteSize - 10; i++) {
             const index = Math.round(i * step);
             result += MASTER_PALETTE[index];
         }
     }
-    cachedPaletteSize = paletteSizeSetting;
+    cachedPaletteSize = effectivePaletteSize;
     cachedPalette = result;
     return result;
 }
@@ -146,7 +158,7 @@ styleElement.innerHTML = `
     border-radius: 14px;
     padding: 16px 8px 16px 16px;
     color: #f3e8ff;
-    width: min(265px, 45vw);
+    width: min(340px, 60vw);
     max-height: 75vh;
     display: none;
     flex-direction: column;
@@ -200,8 +212,10 @@ styleElement.innerHTML = `
 .ascii-action-btn.reset-variant:hover { background: rgba(255, 255, 255, 0.15); border-color: rgba(255, 255, 255, 0.4); box-shadow: 0 0 10px rgba(255, 255, 255, 0.1); }
 .panel-title { font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; color: #c55eff; border-bottom: 1px solid rgba(176, 38, 255, 0.2); padding-bottom: 5px; flex-shrink: 0; padding-right: 8px; }
 .ascii-slider-group { margin-bottom: 10px; }
-.ascii-slider-group label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; letter-spacing: 0.5px; }
+.ascii-slider-group label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; letter-spacing: 0.5px; gap: 10px; }
+.ascii-slider-control { display: flex; align-items: center; gap: 8px; }
 .ascii-slider { width: 100%; accent-color: #b026ff; cursor: pointer; }
+.ascii-slider-control .ascii-slider { flex: 1; min-width: 0; }
 .ascii-toggle-group { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 11px; }
 .ascii-checkbox { accent-color: #b026ff; cursor: pointer; width: 16px; height: 16px; }
 .ascii-color-picker-wrapper { display: flex; align-items: center; gap: 8px; }
@@ -222,6 +236,25 @@ let captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
 let probeCanvas = document.createElement('canvas');
 let probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
 let previousFrameSignature = "";
+const CMD_COLOURS = [
+    [0, 0, 0],
+    [0, 0, 128],
+    [0, 128, 0],
+    [0, 128, 128],
+    [128, 0, 0],
+    [128, 0, 128],
+    [128, 128, 0],
+    [192, 192, 192],
+    [128, 128, 128],
+    [0, 0, 255],
+    [0, 255, 0],
+    [0, 255, 255],
+    [255, 0, 0],
+    [255, 0, 255],
+    [255, 255, 0],
+    [255, 255, 255]
+];
+const cmdColourStringCache = CMD_COLOURS.map(([r, g, b]) => `rgb(${r},${g},${b})`);
 const rgbStringCache = new Array(4096);
 
 function hexToRgb(hex) {
@@ -231,6 +264,26 @@ function hexToRgb(hex) {
         g: parseInt(result[2], 16),
         b: parseInt(result[3], 16)
     } : { r: 188, g: 19, b: 254 };
+}
+
+function commandPromptColourString(r, g, b) {
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+
+    for (let i = 0; i < CMD_COLOURS.length; i++) {
+        const colour = CMD_COLOURS[i];
+        const dr = r - colour[0];
+        const dg = g - colour[1];
+        const db = b - colour[2];
+        const distance = dr * dr + dg * dg + db * db;
+
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+
+    return cmdColourStringCache[bestIndex];
 }
 
 function quantizedRgbString(r, g, b) {
@@ -246,6 +299,36 @@ function quantizedRgbString(r, g, b) {
     }
 
     return value;
+}
+
+function renderColourString(r, g, b) {
+    return cmdColoursMode
+        ? commandPromptColourString(r, g, b)
+        : quantizedRgbString(r, g, b);
+}
+
+function effectiveResolution() {
+    return resolutionSettingEnabled ? charResolution : DEFAULT_RESOLUTION;
+}
+
+function effectiveBrightness() {
+    return brightnessSettingEnabled ? brightnessSetting : DEFAULT_BRIGHTNESS;
+}
+
+function effectiveContrast() {
+    return contrastSettingEnabled ? contrastSetting : DEFAULT_CONTRAST;
+}
+
+function effectiveSaturation() {
+    return saturationSettingEnabled ? saturationSetting : DEFAULT_SATURATION;
+}
+
+function effectiveNoise() {
+    return noiseSettingEnabled ? noiseSetting : DEFAULT_NOISE;
+}
+
+function effectiveBlur() {
+    return blurSettingEnabled ? blurSetting : DEFAULT_BLUR;
 }
 
 function markRendererDirty() {
@@ -388,6 +471,14 @@ function clearAndForceResizeBuffers() {
     forceRender = true;
 }
 
+function clearDisplayedAsciiFrame() {
+    if (!displayCanvas || !displayCtx) return;
+
+    displayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    displayCtx.fillStyle = '#05010a';
+    displayCtx.fillRect(0, 0, displayCanvas.width, displayCanvas.height);
+}
+
 function randomizeShaders() {
     charResolution = Math.floor(Math.random() * (300 - 80 + 1)) + 80;
     paletteSizeSetting = Math.floor(Math.random() * (MASTER_PALETTE.length - 4 + 1)) + 4;
@@ -396,6 +487,13 @@ function randomizeShaders() {
     saturationSetting = parseFloat((Math.random() * (2.5 - 0.0) + 0.0).toFixed(1));
     noiseSetting = Math.floor(Math.random() * 5) * 10;
     blurSetting = parseFloat((Math.random() * 1.5).toFixed(1));
+    resolutionSettingEnabled = true;
+    paletteSettingEnabled = true;
+    brightnessSettingEnabled = true;
+    contrastSettingEnabled = true;
+    saturationSettingEnabled = true;
+    noiseSettingEnabled = true;
+    blurSettingEnabled = true;
 
     const modeRoll = Math.random();
     solidPixelMode = modeRoll > 0.80;
@@ -404,6 +502,7 @@ function randomizeShaders() {
     colorInversionMode = Math.random() > 0.85;
     scanlineMode = Math.random() > 0.40;
     tintMode = Math.random() > 0.50 || thermalMode === false;
+    cmdColoursMode = Math.random() > 0.5;
     customTintHex = "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
 
     syncGlobalVariablesToUi();
@@ -419,12 +518,20 @@ function resetShaders() {
     brightnessSetting = DEFAULT_BRIGHTNESS;
     noiseSetting = DEFAULT_NOISE;
     blurSetting = DEFAULT_BLUR;
+    resolutionSettingEnabled = true;
+    paletteSettingEnabled = true;
+    brightnessSettingEnabled = true;
+    contrastSettingEnabled = true;
+    saturationSettingEnabled = true;
+    noiseSettingEnabled = true;
+    blurSettingEnabled = true;
     solidPixelMode = false;
     edgeDetectionMode = false;
     colorInversionMode = false;
     scanlineMode = false;
     thermalMode = false;
     tintMode = false;
+    cmdColoursMode = DEFAULT_CMD_COLOURS;
     customTintHex = DEFAULT_TINT_HEX;
 
     syncGlobalVariablesToUi();
@@ -434,25 +541,40 @@ function resetShaders() {
 
 function syncGlobalVariablesToUi() {
     if (!document.getElementById('ascii-control-panel')) return;
+    document.getElementById('res-enable').checked = resolutionSettingEnabled;
     document.getElementById('res-slider').value = charResolution;
-    document.getElementById('res-val').innerText = charResolution;
+    document.getElementById('res-slider').disabled = !resolutionSettingEnabled;
+    document.getElementById('res-val').innerText = effectiveResolution();
+    document.getElementById('palette-enable').checked = paletteSettingEnabled;
     document.getElementById('palette-slider').value = paletteSizeSetting;
-    document.getElementById('palette-val').innerText = paletteSizeSetting + " Chars";
+    document.getElementById('palette-slider').disabled = !paletteSettingEnabled;
+    document.getElementById('palette-val').innerText = (paletteSettingEnabled ? paletteSizeSetting : DEFAULT_PALETTE_SIZE) + " Chars";
+    document.getElementById('brightness-enable').checked = brightnessSettingEnabled;
     document.getElementById('brightness-slider').value = brightnessSetting;
-    document.getElementById('brightness-val').innerText = Math.round(brightnessSetting * 100) + "%";
+    document.getElementById('brightness-slider').disabled = !brightnessSettingEnabled;
+    document.getElementById('brightness-val').innerText = Math.round(effectiveBrightness() * 100) + "%";
+    document.getElementById('contrast-enable').checked = contrastSettingEnabled;
     document.getElementById('contrast-slider').value = contrastSetting;
-    document.getElementById('contrast-val').innerText = contrastSetting.toFixed(1);
+    document.getElementById('contrast-slider').disabled = !contrastSettingEnabled;
+    document.getElementById('contrast-val').innerText = effectiveContrast().toFixed(1);
+    document.getElementById('sat-enable').checked = saturationSettingEnabled;
     document.getElementById('sat-slider').value = saturationSetting;
-    document.getElementById('sat-val').innerText = saturationSetting.toFixed(1);
+    document.getElementById('sat-slider').disabled = !saturationSettingEnabled;
+    document.getElementById('sat-val').innerText = effectiveSaturation().toFixed(1);
+    document.getElementById('noise-enable').checked = noiseSettingEnabled;
     document.getElementById('noise-slider').value = noiseSetting;
-    document.getElementById('noise-val').innerText = noiseSetting;
+    document.getElementById('noise-slider').disabled = !noiseSettingEnabled;
+    document.getElementById('noise-val').innerText = effectiveNoise();
+    document.getElementById('blur-enable').checked = blurSettingEnabled;
     document.getElementById('blur-slider').value = blurSetting;
-    document.getElementById('blur-val').innerText = blurSetting.toFixed(1) + "px";
+    document.getElementById('blur-slider').disabled = !blurSettingEnabled;
+    document.getElementById('blur-val').innerText = effectiveBlur().toFixed(1) + "px";
     document.getElementById('solid-toggle').checked = solidPixelMode;
     document.getElementById('edge-toggle').checked = edgeDetectionMode;
     document.getElementById('invert-toggle').checked = colorInversionMode;
     document.getElementById('scanline-toggle').checked = scanlineMode;
     document.getElementById('thermal-toggle').checked = thermalMode;
+    document.getElementById('cmd-colours-toggle').checked = cmdColoursMode;
     document.getElementById('tint-toggle').checked = tintMode;
     document.getElementById('tint-picker').value = customTintHex;
 }
@@ -470,32 +592,32 @@ function createUiPanel() {
                     <input type="checkbox" id="master-ascii-toggle" class="ascii-checkbox" ${asciiEnabled ? 'checked' : ''}>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Resolution</span><span id="res-val">${charResolution}</span></label>
-                    <input type="range" id="res-slider" class="ascii-slider" min="50" max="350" value="${charResolution}">
+                    <label><span>Resolution</span><span id="res-val">${effectiveResolution()}</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="res-enable" class="ascii-checkbox" ${resolutionSettingEnabled ? 'checked' : ''}><input type="range" id="res-slider" class="ascii-slider" min="50" max="350" value="${charResolution}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Palette Details</span><span id="palette-val">${paletteSizeSetting} Chars</span></label>
-                    <input type="range" id="palette-slider" class="ascii-slider" min="4" max="${MASTER_PALETTE.length}" step="1" value="${paletteSizeSetting}">
+                    <label><span>Palette Details</span><span id="palette-val">${paletteSettingEnabled ? paletteSizeSetting : DEFAULT_PALETTE_SIZE} Chars</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="palette-enable" class="ascii-checkbox" ${paletteSettingEnabled ? 'checked' : ''}><input type="range" id="palette-slider" class="ascii-slider" min="4" max="${MASTER_PALETTE.length}" step="1" value="${paletteSizeSetting}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Brightness</span><span id="brightness-val">${Math.round(brightnessSetting * 100)}%</span></label>
-                    <input type="range" id="brightness-slider" class="ascii-slider" min="0.5" max="1.5" step="0.05" value="${brightnessSetting}">
+                    <label><span>Brightness</span><span id="brightness-val">${Math.round(effectiveBrightness() * 100)}%</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="brightness-enable" class="ascii-checkbox" ${brightnessSettingEnabled ? 'checked' : ''}><input type="range" id="brightness-slider" class="ascii-slider" min="0.5" max="1.5" step="0.05" value="${brightnessSetting}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Contrast</span><span id="contrast-val">${contrastSetting.toFixed(1)}</span></label>
-                    <input type="range" id="contrast-slider" class="ascii-slider" min="0.5" max="2.5" step="0.1" value="${contrastSetting}">
+                    <label><span>Contrast</span><span id="contrast-val">${effectiveContrast().toFixed(1)}</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="contrast-enable" class="ascii-checkbox" ${contrastSettingEnabled ? 'checked' : ''}><input type="range" id="contrast-slider" class="ascii-slider" min="0.5" max="2.5" step="0.1" value="${contrastSetting}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Saturation</span><span id="sat-val">${saturationSetting.toFixed(1)}</span></label>
-                    <input type="range" id="sat-slider" class="ascii-slider" min="0.0" max="3.0" step="0.1" value="${saturationSetting}">
+                    <label><span>Saturation</span><span id="sat-val">${effectiveSaturation().toFixed(1)}</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="sat-enable" class="ascii-checkbox" ${saturationSettingEnabled ? 'checked' : ''}><input type="range" id="sat-slider" class="ascii-slider" min="0.0" max="3.0" step="0.1" value="${saturationSetting}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Gaussian Noise</span><span id="noise-val">${noiseSetting}</span></label>
-                    <input type="range" id="noise-slider" class="ascii-slider" min="0" max="80" step="5" value="${noiseSetting}">
+                    <label><span>Gaussian Noise</span><span id="noise-val">${effectiveNoise()}</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="noise-enable" class="ascii-checkbox" ${noiseSettingEnabled ? 'checked' : ''}><input type="range" id="noise-slider" class="ascii-slider" min="0" max="80" step="5" value="${noiseSetting}"></div>
                 </div>
                 <div class="ascii-slider-group">
-                    <label><span>Pre-Blur</span><span id="blur-val">${blurSetting.toFixed(1) + "px"}</span></label>
-                    <input type="range" id="blur-slider" class="ascii-slider" min="0" max="5" step="0.1" value="${blurSetting}">
+                    <label><span>Pre-Blur</span><span id="blur-val">${effectiveBlur().toFixed(1) + "px"}</span></label>
+                    <div class="ascii-slider-control"><input type="checkbox" id="blur-enable" class="ascii-checkbox" ${blurSettingEnabled ? 'checked' : ''}><input type="range" id="blur-slider" class="ascii-slider" min="0" max="5" step="0.1" value="${blurSetting}"></div>
                 </div>
                 <details class="ascii-details">
                     <summary class="ascii-summary">Extra Settings</summary>
@@ -504,6 +626,7 @@ function createUiPanel() {
                     <div class="ascii-toggle-group"><span>Invert Colors</span><input type="checkbox" id="invert-toggle" class="ascii-checkbox"></div>
                     <div class="ascii-toggle-group"><span>CRT Scanlines</span><input type="checkbox" id="scanline-toggle" class="ascii-checkbox"></div>
                     <div class="ascii-toggle-group"><span>Thermal / Heatmap</span><input type="checkbox" id="thermal-toggle" class="ascii-checkbox"></div>
+                    <div class="ascii-toggle-group"><span>CMD Colours</span><input type="checkbox" id="cmd-colours-toggle" class="ascii-checkbox" ${cmdColoursMode ? 'checked' : ''}></div>
                     <div class="ascii-toggle-group">
                         <span>Color Tint Mode</span>
                         <div class="ascii-color-picker-wrapper">
@@ -524,18 +647,26 @@ function createUiPanel() {
 
         // Events
         document.getElementById('master-ascii-toggle').addEventListener('change', (e) => { asciiEnabled = e.target.checked; if (asciiEnabled) clearAndForceResizeBuffers(); });
-        document.getElementById('res-slider').addEventListener('input', (e) => { charResolution = parseInt(e.target.value); document.getElementById('res-val').innerText = charResolution; });
-        document.getElementById('palette-slider').addEventListener('input', (e) => { paletteSizeSetting = parseInt(e.target.value); document.getElementById('palette-val').innerText = paletteSizeSetting + " Chars"; });
-        document.getElementById('brightness-slider').addEventListener('input', (e) => { brightnessSetting = parseFloat(e.target.value); document.getElementById('brightness-val').innerText = Math.round(brightnessSetting * 100) + "%"; });
-        document.getElementById('contrast-slider').addEventListener('input', (e) => { contrastSetting = parseFloat(e.target.value); document.getElementById('contrast-val').innerText = contrastSetting.toFixed(1); });
-        document.getElementById('sat-slider').addEventListener('input', (e) => { saturationSetting = parseFloat(e.target.value); document.getElementById('sat-val').innerText = saturationSetting.toFixed(1); });
-        document.getElementById('noise-slider').addEventListener('input', (e) => { noiseSetting = parseInt(e.target.value); document.getElementById('noise-val').innerText = noiseSetting; });
-        document.getElementById('blur-slider').addEventListener('input', (e) => { blurSetting = parseFloat(e.target.value); document.getElementById('blur-val').innerText = blurSetting.toFixed(1) + "px"; });
+        document.getElementById('res-enable').addEventListener('change', (e) => { resolutionSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); clearAndForceResizeBuffers(); });
+        document.getElementById('palette-enable').addEventListener('change', (e) => { paletteSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); clearAndForceResizeBuffers(); });
+        document.getElementById('brightness-enable').addEventListener('change', (e) => { brightnessSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); });
+        document.getElementById('contrast-enable').addEventListener('change', (e) => { contrastSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); });
+        document.getElementById('sat-enable').addEventListener('change', (e) => { saturationSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); });
+        document.getElementById('noise-enable').addEventListener('change', (e) => { noiseSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); });
+        document.getElementById('blur-enable').addEventListener('change', (e) => { blurSettingEnabled = e.target.checked; syncGlobalVariablesToUi(); });
+        document.getElementById('res-slider').addEventListener('input', (e) => { charResolution = parseInt(e.target.value); document.getElementById('res-val').innerText = effectiveResolution(); });
+        document.getElementById('palette-slider').addEventListener('input', (e) => { paletteSizeSetting = parseInt(e.target.value); document.getElementById('palette-val').innerText = (paletteSettingEnabled ? paletteSizeSetting : DEFAULT_PALETTE_SIZE) + " Chars"; });
+        document.getElementById('brightness-slider').addEventListener('input', (e) => { brightnessSetting = parseFloat(e.target.value); document.getElementById('brightness-val').innerText = Math.round(effectiveBrightness() * 100) + "%"; });
+        document.getElementById('contrast-slider').addEventListener('input', (e) => { contrastSetting = parseFloat(e.target.value); document.getElementById('contrast-val').innerText = effectiveContrast().toFixed(1); });
+        document.getElementById('sat-slider').addEventListener('input', (e) => { saturationSetting = parseFloat(e.target.value); document.getElementById('sat-val').innerText = effectiveSaturation().toFixed(1); });
+        document.getElementById('noise-slider').addEventListener('input', (e) => { noiseSetting = parseInt(e.target.value); document.getElementById('noise-val').innerText = effectiveNoise(); });
+        document.getElementById('blur-slider').addEventListener('input', (e) => { blurSetting = parseFloat(e.target.value); document.getElementById('blur-val').innerText = effectiveBlur().toFixed(1) + "px"; });
         document.getElementById('solid-toggle').addEventListener('change', (e) => { solidPixelMode = e.target.checked; });
         document.getElementById('edge-toggle').addEventListener('change', (e) => { edgeDetectionMode = e.target.checked; });
         document.getElementById('invert-toggle').addEventListener('change', (e) => { colorInversionMode = e.target.checked; });
         document.getElementById('scanline-toggle').addEventListener('change', (e) => { scanlineMode = e.target.checked; });
         document.getElementById('thermal-toggle').addEventListener('change', (e) => { thermalMode = e.target.checked; });
+        document.getElementById('cmd-colours-toggle').addEventListener('change', (e) => { cmdColoursMode = e.target.checked; });
         document.getElementById('tint-toggle').addEventListener('change', (e) => { tintMode = e.target.checked; });
         document.getElementById('tint-picker').addEventListener('input', (e) => { customTintHex = e.target.value; });
         document.getElementById('ascii-random-btn').addEventListener('click', randomizeShaders);
@@ -604,6 +735,7 @@ function processPanoramaToAscii() {
     if (webGlCanvas.width !== lastKnownWebGLWidth || webGlCanvas.height !== lastKnownWebGLHeight) {
         lastKnownWebGLWidth = webGlCanvas.width;
         lastKnownWebGLHeight = webGlCanvas.height;
+        clearDisplayedAsciiFrame();
         clearAndForceResizeBuffers();
     }
 
@@ -615,7 +747,8 @@ function processPanoramaToAscii() {
     createAsciiOverlay(gameContainer);
 
     const now = performance.now();
-    const needsAnimatedFrame = noiseSetting > 0;
+    const currentNoise = effectiveNoise();
+    const needsAnimatedFrame = currentNoise > 0;
     let frameChanged = forceRender || needsAnimatedFrame;
 
     if (!frameChanged && now - lastChangeCheckTime >= 1000 / CHANGE_CHECK_FPS) {
@@ -642,7 +775,7 @@ function processPanoramaToAscii() {
         return;
     }
 
-    const targetWidth = charResolution;
+    const targetWidth = effectiveResolution();
     const canvasAspect = webGlCanvas.height / webGlCanvas.width;
     const targetHeight = Math.round(targetWidth * canvasAspect * 1.35);
 
@@ -666,7 +799,8 @@ function processPanoramaToAscii() {
 
     try {
         captureCtx.clearRect(0, 0, targetWidth, targetHeight);
-        if (blurSetting > 0) { captureCtx.filter = `blur(${blurSetting}px)`; } else { captureCtx.filter = 'none'; }
+        const currentBlur = effectiveBlur();
+        if (currentBlur > 0) { captureCtx.filter = `blur(${currentBlur}px)`; } else { captureCtx.filter = 'none'; }
         captureCtx.drawImage(webGlCanvas, 0, 0, targetWidth, targetHeight);
         captureCtx.filter = 'none';
 
@@ -683,6 +817,9 @@ function processPanoramaToAscii() {
         const cellHeight = 10;
         const tintRgb = hexToRgb(customTintHex);
         const currentPalette = getDynamicPalette();
+        const currentBrightness = effectiveBrightness();
+        const currentContrast = effectiveContrast();
+        const currentSaturation = effectiveSaturation();
 
         for (let y = 0; y < targetHeight; y++) {
             const isScanlineRow = scanlineMode && (y % 2 === 0);
@@ -690,18 +827,18 @@ function processPanoramaToAscii() {
                 const i = (y * targetWidth + x) * 4;
                 let r = data[i]; let g = data[i+1]; let b = data[i+2];
 
-                if (brightnessSetting !== 1.0) { r *= brightnessSetting; g *= brightnessSetting; b *= brightnessSetting; }
+                if (currentBrightness !== 1.0) { r *= currentBrightness; g *= currentBrightness; b *= currentBrightness; }
                 if (colorInversionMode) { r = 255 - r; g = 255 - g; b = 255 - b; }
-                if (contrastSetting !== 1.0) {
-                    r = ((r - 128) * contrastSetting) + 128;
-                    g = ((g - 128) * contrastSetting) + 128;
-                    b = ((b - 128) * contrastSetting) + 128;
+                if (currentContrast !== 1.0) {
+                    r = ((r - 128) * currentContrast) + 128;
+                    g = ((g - 128) * currentContrast) + 128;
+                    b = ((b - 128) * currentContrast) + 128;
                 }
-                if (saturationSetting !== 1.0) {
+                if (currentSaturation !== 1.0) {
                     const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-                    r = gray + (r - gray) * saturationSetting; g = gray + (g - gray) * saturationSetting; b = gray + (b - gray) * saturationSetting;
+                    r = gray + (r - gray) * currentSaturation; g = gray + (g - gray) * currentSaturation; b = gray + (b - gray) * currentSaturation;
                 }
-                if (noiseSetting > 0) { const noise = generateGaussianNoise(noiseSetting); r += noise; g += noise; b += noise; }
+                if (currentNoise > 0) { const noise = generateGaussianNoise(currentNoise); r += noise; g += noise; b += noise; }
 
                 r = Math.min(255, Math.max(0, r)); g = Math.min(255, Math.max(0, g)); b = Math.min(255, Math.max(0, b));
 
@@ -735,8 +872,8 @@ function processPanoramaToAscii() {
                 }
 
                 if (char !== ' ') {
-                    if (isScanlineRow) { displayCtx.fillStyle = quantizedRgbString(r * 0.25, g * 0.25, b * 0.25); }
-                    else { displayCtx.fillStyle = quantizedRgbString(r, g, b); }
+                    if (isScanlineRow) { displayCtx.fillStyle = renderColourString(r * 0.25, g * 0.25, b * 0.25); }
+                    else { displayCtx.fillStyle = renderColourString(r, g, b); }
                     displayCtx.fillText(char, x * cellWidth, y * cellHeight);
                 }
             }
@@ -773,6 +910,7 @@ function setupPanoramaMutationObserver(targetContainer) {
                 if (ownOverlayChanged) continue;
 
                 lastKnownWebGLWidth = 0; lastKnownWebGLHeight = 0;
+                clearDisplayedAsciiFrame();
                 clearAndForceResizeBuffers();
                 requestImmediateRender();
                 break;
