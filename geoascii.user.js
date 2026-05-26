@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GeoASCII
 // @description  Transforms GeoGuessr panoramas into a live, fully customizable ASCII text art display with native retro filter controls.
-// @version      1.12.0
+// @version      1.13.0
 // @author       maxtmiller
 // @match        https://www.geoguessr.com/*
 // @run-at       document-start
@@ -68,13 +68,23 @@ let userInteracting = false;
 let interactionTimeout = null;
 let mapInteractionUntil = 0;
 let mapPointerDown = false;
+let mapPointerId = null;
+let activeWebGlCanvas = null;
+let waitingForFirstAsciiFrame = true;
+let transitionBlockedCanvas = null;
+let transitionBlockedFrameSignature = "";
+let transitionSameCanvasBlockUntil = 0;
+let transitionBlockUntil = 0;
 
 const ACTIVE_FPS = 15;
 const MOVEMENT_FPS = 30;
+const FIRST_FRAME_FPS = 60;
 const IDLE_FPS = 2;
 const CHANGE_CHECK_FPS = 20;
-const MAP_PAUSE_AFTER_INTERACTION_MS = 2500;
-const MAP_POINTER_RELEASE_PAUSE_MS = 900;
+const MAP_WHEEL_PAUSE_MS = 180;
+const MAP_POINTER_RELEASE_PAUSE_MS = 120;
+const TRANSITION_SAME_CANVAS_BLOCK_MS = 900;
+const TRANSITION_BLOCK_FALLBACK_MS = 1200;
 let currentFpsInterval = 1000 / ACTIVE_FPS;
 let lastChangeCheckTime = 0;
 
@@ -131,22 +141,22 @@ HTMLCanvasElement.prototype.getContext = function (type, attributes) {
 const styleElement = document.createElement("style");
 styleElement.innerHTML = `
 #ascii-art-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background-color: #05010a;
-    overflow: hidden;
-    z-index: 9;
-    pointer-events: none;
-    display: flex;
-    justify-content: center;
-    align-items: center;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    background-color: #05010a !important;
+    overflow: hidden !important;
+    z-index: 2147483000 !important;
+    pointer-events: none !important;
+    display: flex !important;
+    justify-content: center !important;
+    align-items: center !important;
 }
 #ascii-display-canvas {
-    transform-origin: center center;
-    image-rendering: pixelated;
+    transform-origin: center center !important;
+    image-rendering: pixelated !important;
 }
 #ascii-control-panel {
     position: absolute;
@@ -226,7 +236,16 @@ styleElement.innerHTML = `
 .ascii-summary::after { content: '▼'; font-size: 9px; transition: transform 0.2s ease; color: rgba(176, 38, 255, 0.7); }
 .ascii-details[open] .ascii-summary::after { transform: rotate(180deg); }
 `;
-document.head.appendChild(styleElement);
+
+function appendStyleElement() {
+    const styleParent = document.head || document.documentElement;
+    if (!styleParent || styleElement.isConnected) return;
+
+    styleParent.appendChild(styleElement);
+}
+
+appendStyleElement();
+document.addEventListener('DOMContentLoaded', appendStyleElement, { once: true });
 
 let asciiWrapper = null;
 let displayCanvas = null;
@@ -336,6 +355,16 @@ function markRendererDirty() {
     previousFrameSignature = "";
 }
 
+function closestElement(target, selector) {
+    if (!target) return null;
+
+    const element = target.nodeType === Node.ELEMENT_NODE
+        ? target
+        : target.parentElement;
+
+    return element ? element.closest(selector) : null;
+}
+
 function isVisibleElement(element) {
     if (!element) return false;
 
@@ -366,11 +395,17 @@ function isResultsScreenActive() {
 }
 
 function isGuessMapElement(element) {
-    if (!element || element.closest('#ascii-control-panel') || element.closest('.native-ascii-btn')) {
+    const targetElement = closestElement(element, '*');
+
+    if (
+        !targetElement ||
+        targetElement.closest('#ascii-control-panel') ||
+        targetElement.closest('.native-ascii-btn')
+    ) {
         return false;
     }
 
-    const mapElement = element.closest([
+    const mapElement = targetElement.closest([
         '[data-qa="guess-map"]',
         '[data-qa="guess-map-canvas"]',
         '[data-qa="guess-map__canvas"]',
@@ -387,9 +422,76 @@ function isGuessMapElement(element) {
     return true;
 }
 
-function markMapInteraction(event) {
+function isRoundTransitionControl(element) {
+    const targetElement = closestElement(element, '*');
+
+    if (
+        !targetElement ||
+        targetElement.closest('#ascii-control-panel') ||
+        targetElement.closest('.native-ascii-btn')
+    ) {
+        return false;
+    }
+
+    const control = targetElement.closest('button, a, [role="button"]');
+    if (!control || !isVisibleElement(control)) return false;
+
+    const combinedText = [
+        control.textContent,
+        control.getAttribute('aria-label'),
+        control.getAttribute('data-qa'),
+        control.className
+    ].join(' ').toLowerCase();
+
+    return (
+        /\b(next|play)\s+round\b/.test(combinedText) ||
+        /\bnext\b/.test(combinedText) && /\bround\b/.test(combinedText) ||
+        /\b(play\s+next|start\s+game|play\s+again|new\s+round)\b/.test(combinedText)
+    );
+}
+
+function handlePossibleRoundTransition(event) {
+    if (!cachedIsGame && !isGameRoute()) return;
+    if (!isRoundTransitionControl(event.target)) return;
+
+    resetForPanoramaTransition();
+    coverPanoramaIfPossible();
+    requestImmediateRender();
+}
+
+function isTextEntryElement(element) {
+    const targetElement = closestElement(element, '*');
+
+    return !!(
+        targetElement &&
+        (
+            targetElement.isContentEditable ||
+            targetElement.closest('input, textarea, select, [contenteditable="true"]')
+        )
+    );
+}
+
+function handlePossibleRoundTransitionKey(event) {
+    if (event.key !== ' ' && event.key !== 'Enter') return;
+    if (!cachedIsGame && !isGameRoute()) return;
+    if (isTextEntryElement(event.target)) return;
+
+    const activeElement = document.activeElement;
+    const shouldReset =
+        isRoundTransitionControl(activeElement) ||
+        isRoundTransitionControl(event.target) ||
+        isResultsScreenActive();
+
+    if (!shouldReset) return;
+
+    resetForPanoramaTransition();
+    coverPanoramaIfPossible();
+    requestImmediateRender();
+}
+
+function markMapInteraction(event, durationMs) {
     if (isGuessMapElement(event.target)) {
-        mapInteractionUntil = performance.now() + MAP_PAUSE_AFTER_INTERACTION_MS;
+        mapInteractionUntil = performance.now() + durationMs;
     }
 }
 
@@ -401,21 +503,37 @@ function beginMapPointer(event) {
     if (!isGuessMapElement(event.target)) return;
 
     mapPointerDown = true;
-    markMapInteraction(event);
+    mapPointerId = event.pointerId ?? 'touch';
+    mapInteractionUntil = 0;
 }
 
-function endMapPointer() {
+function endMapPointer(event) {
     if (!mapPointerDown) return;
+    if (event && mapPointerId !== null && event.pointerId !== undefined && event.pointerId !== mapPointerId) return;
 
     mapPointerDown = false;
+    mapPointerId = null;
     mapInteractionUntil = performance.now() + MAP_POINTER_RELEASE_PAUSE_MS;
 }
 
+function handleMapWheel(event) {
+    markMapInteraction(event, MAP_WHEEL_PAUSE_MS);
+}
+
+function cancelMapInteraction() {
+    mapPointerDown = false;
+    mapPointerId = null;
+    mapInteractionUntil = 0;
+}
+
 function beginInteraction(event) {
+    if (event && isGuessMapElement(event.target)) {
+        return;
+    }
+
     userInteracting = true;
     cameraMoving = true;
     lastMovementTime = performance.now();
-    if (event) markMapInteraction(event);
 
     clearTimeout(interactionTimeout);
     interactionTimeout = setTimeout(() => {
@@ -423,8 +541,8 @@ function beginInteraction(event) {
     }, 160);
 }
 
-function frameSignatureChanged(webGlCanvas) {
-    if (!probeCtx || !webGlCanvas) return true;
+function canvasFrameSignature(webGlCanvas) {
+    if (!probeCtx || !webGlCanvas) return "";
 
     const probeWidth = 24;
     const probeHeight = 14;
@@ -447,12 +565,19 @@ function frameSignatureChanged(webGlCanvas) {
             );
         }
 
-        const changed = signature !== previousFrameSignature;
-        previousFrameSignature = signature;
-        return changed;
+        return signature;
     } catch (e) {
-        return true;
+        return "";
     }
+}
+
+function frameSignatureChanged(webGlCanvas) {
+    const signature = canvasFrameSignature(webGlCanvas);
+    if (!signature) return true;
+
+    const changed = signature !== previousFrameSignature;
+    previousFrameSignature = signature;
+    return changed;
 }
 
 function generateGaussianNoise(stdDev) {
@@ -471,12 +596,63 @@ function clearAndForceResizeBuffers() {
     forceRender = true;
 }
 
+function resetForPanoramaTransition() {
+    const currentCanvas = activeWebGlCanvas || cachedWebGlCanvas;
+    const now = performance.now();
+    transitionBlockedCanvas = currentCanvas;
+    transitionBlockedFrameSignature = canvasFrameSignature(currentCanvas);
+    transitionSameCanvasBlockUntil = now + TRANSITION_SAME_CANVAS_BLOCK_MS;
+    transitionBlockUntil = now + TRANSITION_BLOCK_FALLBACK_MS;
+    lastKnownWebGLWidth = 0;
+    lastKnownWebGLHeight = 0;
+    cachedWebGlCanvas = null;
+    activeWebGlCanvas = null;
+    clearAndForceResizeBuffers();
+    beginFirstFrameMode();
+    clearDisplayedAsciiFrame();
+}
+
+function beginFirstFrameMode() {
+    waitingForFirstAsciiFrame = true;
+    forceRender = true;
+    lastFrameTime = 0;
+    currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+}
+
 function clearDisplayedAsciiFrame() {
     if (!displayCanvas || !displayCtx) return;
 
     displayCtx.setTransform(1, 0, 0, 1, 0, 0);
     displayCtx.fillStyle = '#05010a';
     displayCtx.fillRect(0, 0, displayCanvas.width, displayCanvas.height);
+}
+
+function imageDataHasVisibleContent(data) {
+    let total = 0;
+    const step = Math.max(4, Math.floor(data.length / 256) & ~3);
+
+    for (let i = 0; i < data.length; i += step) {
+        total += data[i] + data[i + 1] + data[i + 2];
+        if (total > 600) return true;
+    }
+
+    return false;
+}
+
+function nodeContainsPanoramaCanvas(node) {
+    if (!(node instanceof Element)) return false;
+
+    return !!(
+        node.matches('canvas, .widget-scene-canvas, [data-is-intercepted-webgl="true"]') ||
+        node.querySelector('canvas, .widget-scene-canvas, [data-is-intercepted-webgl="true"]')
+    );
+}
+
+function mutationTouchesPanoramaCanvas(mutation) {
+    return (
+        [...mutation.addedNodes].some(nodeContainsPanoramaCanvas) ||
+        [...mutation.removedNodes].some(nodeContainsPanoramaCanvas)
+    );
 }
 
 function randomizeShaders() {
@@ -701,7 +877,20 @@ function createUiPanel() {
 }
 
 function createAsciiOverlay(gameContainer) {
-    if (document.getElementById('ascii-art-canvas')) return;
+    const existingWrapper = document.getElementById('ascii-art-canvas');
+    if (existingWrapper) {
+        asciiWrapper = existingWrapper;
+        displayCanvas = existingWrapper.querySelector('#ascii-display-canvas');
+        displayCtx = displayCanvas ? displayCanvas.getContext('2d') : null;
+
+        if (existingWrapper.parentElement !== gameContainer) {
+            gameContainer.appendChild(existingWrapper);
+            clearDisplayedAsciiFrame();
+            beginFirstFrameMode();
+        }
+
+        return;
+    }
 
     asciiWrapper = document.createElement('div');
     asciiWrapper.id = 'ascii-art-canvas';
@@ -709,11 +898,31 @@ function createAsciiOverlay(gameContainer) {
     displayCanvas = document.createElement('canvas');
     displayCanvas.id = 'ascii-display-canvas';
     displayCtx = displayCanvas.getContext('2d');
+    displayCanvas.width = Math.max(1, window.innerWidth);
+    displayCanvas.height = Math.max(1, window.innerHeight);
+    clearDisplayedAsciiFrame();
 
     asciiWrapper.appendChild(displayCanvas);
     gameContainer.appendChild(asciiWrapper);
 
     // REMOVED createUiPanel() FROM HERE TO PREVENT FRAMERATE OVERRIDES
+}
+
+function coverPanoramaIfPossible() {
+    if (!asciiEnabled) return;
+
+    const liveGameContainer = document.querySelector('[data-qa=panorama]');
+    const gameContainer = liveGameContainer || (cachedGameContainer && cachedGameContainer.isConnected ? cachedGameContainer : null);
+
+    if (liveGameContainer && liveGameContainer !== cachedGameContainer) {
+        cachedGameContainer = liveGameContainer;
+        resetForPanoramaTransition();
+    }
+
+    if (gameContainer) {
+        createAsciiOverlay(gameContainer);
+        if (waitingForFirstAsciiFrame) beginFirstFrameMode();
+    }
 }
 
 function processPanoramaToAscii() {
@@ -722,21 +931,79 @@ function processPanoramaToAscii() {
         return;
     }
 
-    const gameContainer = cachedGameContainer || document.querySelector('[data-qa=panorama]');
+    const liveGameContainer = document.querySelector('[data-qa=panorama]');
+    const gameContainer = liveGameContainer || (cachedGameContainer && cachedGameContainer.isConnected ? cachedGameContainer : null);
     if (!gameContainer) return;
 
-    let webGlCanvas = cachedWebGlCanvas ||
+    if (liveGameContainer && liveGameContainer !== cachedGameContainer) {
+        cachedGameContainer = liveGameContainer;
+        resetForPanoramaTransition();
+    }
+
+    createAsciiOverlay(gameContainer);
+
+    let webGlCanvas = (cachedWebGlCanvas && cachedWebGlCanvas.isConnected ? cachedWebGlCanvas : null) ||
                       gameContainer.querySelector('.widget-scene-canvas') ||
                       gameContainer.querySelector('canvas[data-is-intercepted-webgl="true"]');
 
-    if (!webGlCanvas) return;
-    if (webGlCanvas.width <= 300 || webGlCanvas.height <= 150) return;
+    if (!webGlCanvas) {
+        if (waitingForFirstAsciiFrame) currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+        return;
+    }
+
+    if (transitionBlockedCanvas && webGlCanvas !== transitionBlockedCanvas) {
+        transitionBlockedCanvas = null;
+        transitionSameCanvasBlockUntil = 0;
+    }
+
+    if (
+        transitionBlockedCanvas &&
+        webGlCanvas === transitionBlockedCanvas &&
+        performance.now() < transitionSameCanvasBlockUntil
+    ) {
+        forceRender = true;
+        currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+        return;
+    }
+
+    if (transitionBlockedFrameSignature) {
+        const currentSignature = canvasFrameSignature(webGlCanvas);
+
+        if (
+            currentSignature &&
+            currentSignature === transitionBlockedFrameSignature &&
+            performance.now() < transitionBlockUntil
+        ) {
+            forceRender = true;
+            currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+            return;
+        }
+
+        transitionBlockedFrameSignature = "";
+        transitionBlockedCanvas = null;
+        transitionSameCanvasBlockUntil = 0;
+        transitionBlockUntil = 0;
+    }
+
+    if (webGlCanvas !== activeWebGlCanvas) {
+        activeWebGlCanvas = webGlCanvas;
+        beginFirstFrameMode();
+        clearDisplayedAsciiFrame();
+        clearAndForceResizeBuffers();
+    }
+
+    if (webGlCanvas.width <= 300 || webGlCanvas.height <= 150) {
+        if (waitingForFirstAsciiFrame) currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+        return;
+    }
 
     if (webGlCanvas.width !== lastKnownWebGLWidth || webGlCanvas.height !== lastKnownWebGLHeight) {
         lastKnownWebGLWidth = webGlCanvas.width;
         lastKnownWebGLHeight = webGlCanvas.height;
-        clearDisplayedAsciiFrame();
         clearAndForceResizeBuffers();
+        if (waitingForFirstAsciiFrame) {
+            clearDisplayedAsciiFrame();
+        }
     }
 
     if (isMapInteractionActive()) {
@@ -744,14 +1011,12 @@ function processPanoramaToAscii() {
         return;
     }
 
-    createAsciiOverlay(gameContainer);
-
     const now = performance.now();
     const currentNoise = effectiveNoise();
     const needsAnimatedFrame = currentNoise > 0;
-    let frameChanged = forceRender || needsAnimatedFrame;
+    let frameChanged = waitingForFirstAsciiFrame || forceRender || needsAnimatedFrame;
 
-    if (!frameChanged && now - lastChangeCheckTime >= 1000 / CHANGE_CHECK_FPS) {
+    if (!waitingForFirstAsciiFrame && !frameChanged && now - lastChangeCheckTime >= 1000 / CHANGE_CHECK_FPS) {
         lastChangeCheckTime = now;
         frameChanged = frameSignatureChanged(webGlCanvas);
     }
@@ -763,7 +1028,9 @@ function processPanoramaToAscii() {
         cameraMoving = false;
     }
 
-    if (cameraMoving || userInteracting) {
+    if (waitingForFirstAsciiFrame) {
+        currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+    } else if (cameraMoving || userInteracting) {
         currentFpsInterval = 1000 / MOVEMENT_FPS;
     } else if (needsAnimatedFrame) {
         currentFpsInterval = 1000 / ACTIVE_FPS;
@@ -806,6 +1073,14 @@ function processPanoramaToAscii() {
 
         const imgData = captureCtx.getImageData(0, 0, targetWidth, targetHeight);
         const data = imgData.data;
+        if (!imageDataHasVisibleContent(data)) {
+            if (waitingForFirstAsciiFrame) {
+                forceRender = true;
+                currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+            }
+            return;
+        }
+
         forceRender = false;
 
         displayCtx.fillStyle = '#05010a';
@@ -881,7 +1156,13 @@ function processPanoramaToAscii() {
         const scaleX = window.innerWidth / displayCanvas.width;
         const scaleY = window.innerHeight / displayCanvas.height;
         displayCanvas.style.transform = `scale(${scaleX * 1.005}, ${scaleY * 1.005})`;
-    } catch (e) {}
+        waitingForFirstAsciiFrame = false;
+    } catch (e) {
+        if (waitingForFirstAsciiFrame) {
+            forceRender = true;
+            currentFpsInterval = 1000 / FIRST_FRAME_FPS;
+        }
+    }
 }
 
 function removeAsciiCanvasOnly() {
@@ -908,10 +1189,9 @@ function setupPanoramaMutationObserver(targetContainer) {
                     [...mutation.removedNodes].some(n => n.id === 'ascii-art-canvas');
 
                 if (ownOverlayChanged) continue;
+                if (!mutationTouchesPanoramaCanvas(mutation)) continue;
 
-                lastKnownWebGLWidth = 0; lastKnownWebGLHeight = 0;
-                clearDisplayedAsciiFrame();
-                clearAndForceResizeBuffers();
+                resetForPanoramaTransition();
                 requestImmediateRender();
                 break;
             }
@@ -937,10 +1217,20 @@ function updateCachedElements() {
     if (!cachedIsGame) {
         cachedGameContainer = null;
         cachedWebGlCanvas = null;
+        activeWebGlCanvas = null;
+        waitingForFirstAsciiFrame = true;
         return;
     }
 
-    cachedGameContainer = document.querySelector('[data-qa=panorama]');
+    const liveGameContainer = document.querySelector('[data-qa=panorama]');
+
+    if (liveGameContainer && liveGameContainer !== cachedGameContainer) {
+        if (cachedGameContainer) resetForPanoramaTransition();
+        cachedGameContainer = liveGameContainer;
+    } else {
+        cachedGameContainer = liveGameContainer;
+    }
+
     cachedWebGlCanvas = cachedGameContainer
         ? cachedGameContainer.querySelector('.widget-scene-canvas') ||
           cachedGameContainer.querySelector('canvas[data-is-intercepted-webgl="true"]')
@@ -1031,7 +1321,13 @@ function liveRenderLoop(timestamp) {
         return;
     }
 
-    if (!cachedIsGame || !cachedGameContainer || !cachedWebGlCanvas) return;
+    if (!cachedIsGame || !cachedGameContainer) {
+        updateCachedElements();
+    }
+
+    if (!cachedIsGame || !cachedGameContainer) return;
+
+    coverPanoramaIfPossible();
 
     const elapsed = timestamp - lastFrameTime;
     if (elapsed < currentFpsInterval) return;
@@ -1045,11 +1341,20 @@ window.addEventListener('mousedown', beginInteraction, { passive: true });
 window.addEventListener('pointermove', beginInteraction, { passive: true });
 window.addEventListener('touchmove', beginInteraction, { passive: true });
 window.addEventListener('wheel', beginInteraction, { passive: true });
+window.addEventListener('wheel', handleMapWheel, { passive: true });
 window.addEventListener('pointerdown', beginMapPointer, { passive: true });
 window.addEventListener('pointerup', endMapPointer, { passive: true });
 window.addEventListener('pointercancel', endMapPointer, { passive: true });
+window.addEventListener('blur', cancelMapInteraction, { passive: true });
 window.addEventListener('touchstart', beginMapPointer, { passive: true });
 window.addEventListener('touchend', endMapPointer, { passive: true });
+window.addEventListener('touchcancel', cancelMapInteraction, { passive: true });
+window.addEventListener('pointerdown', handlePossibleRoundTransition, { capture: true, passive: true });
+window.addEventListener('click', handlePossibleRoundTransition, { capture: true, passive: true });
+window.addEventListener('keydown', handlePossibleRoundTransitionKey, { capture: true, passive: true });
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelMapInteraction();
+}, { passive: true });
 
 startLifecyclePolling();
 updateCachedElements();
